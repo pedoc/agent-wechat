@@ -44,6 +44,7 @@ jobs:
       - name: Resolve the exact upstream commit for this build
         id: resolve
         env:
+          GH_TOKEN: ${{ github.token }}
           REQUESTED: ${{ inputs.version }}
           UPSTREAM: thisnick/agent-wechat
         run: |

@@ -59,14 +59,20 @@ export async function restoreArtifact(directory, destination, { inspect = inspec
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   const [operation, directory, ...args] = process.argv.slice(2);
-  if (!directory) throw new Error('Usage: scripts/ci/artifact.mjs record|restore DIRECTORY [--compiler-file FILE]');
+  const option = (name) => {
+    const index = args.indexOf(name);
+    return index === -1 ? undefined : args[index + 1];
+  };
+  // A cross-target handoff needs the explicit Rust target; without it the host target is used.
+  const targetOption = option('--target');
+  const target = targetOption ? { rustTarget: targetOption } : targetFor();
+  if (!directory) throw new Error('Usage: scripts/ci/artifact.mjs record|restore DIRECTORY [--target RUST_TARGET] [--compiler-file FILE] [--destination PATH]');
   if (operation === 'record') {
-    const fileIndex = args.indexOf('--compiler-file');
-    const compiler = fileIndex === -1 ? undefined : (await readFile(args[fileIndex + 1], 'utf8')).trim();
-    await recordArtifact(resolve(directory), { compiler });
+    const compilerFile = option('--compiler-file');
+    const compiler = compilerFile === undefined ? undefined : (await readFile(compilerFile, 'utf8')).trim();
+    await recordArtifact(resolve(directory), { compiler, target });
   } else if (operation === 'restore') {
-    const target = targetFor();
-    const destination = join(repository, 'packages/native-client-rust/target', target.rustTarget, 'release', executableName(target));
-    console.log(await restoreArtifact(resolve(directory), destination));
+    const destination = resolve(option('--destination') ?? join(repository, 'packages/native-client-rust/target', target.rustTarget, 'release', executableName(target)));
+    console.log(await restoreArtifact(resolve(directory), destination, { target }));
   } else throw new Error(`Unknown CLI artifact operation: ${operation}`);
 }

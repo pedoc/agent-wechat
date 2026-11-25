@@ -37,7 +37,14 @@ const files = await collect(resolve(directory));
 const names = [...files.keys()];
 // The checksum manifest is written into the same directory, so it is excluded by
 // name below; each CLI artifact carries its build identity file.
-const allowed = new Set([...required, 'native-ci-build.json']);
+const allowed = new Set([
+  ...required,
+  'native-ci-build.json',
+  // Each CLI job keeps its own build-identity manifest and upstream notices copy.
+  'wx-win32-x64-checksums.json',
+  'wx-win32-arm64-checksums.json',
+  `wx-v${version}-THIRD-PARTY-NOTICES.txt`,
+]);
 const unexpected = names.filter((name) => !allowed.has(name));
 if (unexpected.length) throw new Error(`Unexpected artifact(s): ${unexpected.join(', ')}`);
 

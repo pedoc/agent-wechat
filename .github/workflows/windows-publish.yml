@@ -106,12 +106,17 @@ jobs:
           if ($dependencies -match '(?i)(VCRUNTIME|MSVCP|libcrypto-|libssl-|libgcc|libstdc\+\+)') {
             throw 'Release executable must not require compiler or separately installed crypto DLLs'
           }
-      - name: Record the verified artifact
+      - name: Package and record the verified artifact
         run: |
           New-Item -ItemType Directory -Force -Path artifacts/cli | Out-Null
-          Copy-Item 'packages/native-client-rust/target/x86_64-pc-windows-msvc/release/wx.exe' `
-            "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-win32-x64.exe" -Force
+          # portable-build names the asset from the package version and writes the
+          # checksum manifest that artifact.mjs verifies against.
+          node scripts/release/portable-build.mjs artifacts/cli
           node scripts/ci/artifact.mjs record artifacts/cli --target x86_64-pc-windows-msvc
+          # The two CLI jobs each produce the same manifest name; keep them apart
+          # so publish can tell which build identity belongs to which asset.
+          Move-Item "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-checksums.json" `
+            'artifacts/cli/wx-win32-x64-checksums.json' -Force
       - uses: actions/upload-artifact@v7
         with:
           name: cli-windows-x64
@@ -145,12 +150,17 @@ jobs:
         run: |
           cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml `
             --target aarch64-pc-windows-msvc --package wx-native
-      - name: Record the verified artifact
+      - name: Package and record the verified artifact
         run: |
           New-Item -ItemType Directory -Force -Path artifacts/cli | Out-Null
-          Copy-Item 'packages/native-client-rust/target/aarch64-pc-windows-msvc/release/wx.exe' `
-            "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-win32-arm64.exe" -Force
+          # portable-build names the asset from the package version and writes the
+          # checksum manifest that artifact.mjs verifies against.
+          node scripts/release/portable-build.mjs artifacts/cli
           node scripts/ci/artifact.mjs record artifacts/cli --target aarch64-pc-windows-msvc
+          # The two CLI jobs each produce the same manifest name; keep them apart
+          # so publish can tell which build identity belongs to which asset.
+          Move-Item "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-checksums.json" `
+            'artifacts/cli/wx-win32-arm64-checksums.json' -Force
       - uses: actions/upload-artifact@v7
         with:
           name: cli-windows-arm64

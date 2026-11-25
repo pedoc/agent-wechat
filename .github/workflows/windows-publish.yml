@@ -1,0 +1,323 @@
+name: Publish Windows builds
+
+# Build the Windows CLI and desktop portable/NSIS artifacts from a tagged upstream
+# release and publish them to this repository's Releases. This replaces the
+# upstream native-release flow, which is bound to npm publication, five platforms,
+# signing identities and a protected environment.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream tag to build, for example v3.0.0
+        required: true
+        type: string
+      confirm_publish:
+        description: Create or update this repository's GitHub Release; otherwise only upload artifacts
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  # Pin both the toolchain and the crate set so a cached dependency graph from one
+  # Rust version cannot be reused by another.
+  RUSTFLAGS: -C target-feature=+crt-static
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+concurrency:
+  group: windows-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      sourceCommit: ${{ steps.resolve.outputs.sourceCommit }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve the exact upstream commit for this build
+        id: resolve
+        env:
+          REQUESTED: ${{ inputs.version }}
+          UPSTREAM: thisnick/agent-wechat
+        run: |
+          set -euo pipefail
+          if [ -z "$REQUESTED" ]; then
+            # A tag push identifies the version without asking GitHub for anything.
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="$REQUESTED"
+          fi
+          case "$tag" in v*) ;; *) echo "::error::Version input must start with v, got $tag"; exit 1 ;; esac
+          # Read the tag through the API so a shallow checkout is enough, then peel
+          # it to the commit it points at.
+          object=$(gh api "repos/$UPSTREAM/git/ref/tags/$tag" --jq '.object')
+          sha=$(printf '%s' "$object" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')
+          kind=$(printf '%s' "$object" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("type", ""))')
+          for _ in $(seq 5); do
+            [ "$kind" = commit ] && break
+            [ "$kind" = tag ] || { echo "::error::Tag $tag resolved to unsupported object $kind"; exit 1; }
+            sha=$(gh api "repos/$UPSTREAM/git/tags/$sha" --jq '.object.sha')
+            kind=commit
+          done
+          [ "$kind" = commit ] || { echo "::error::Could not peel tag $tag to a commit"; exit 1; }
+          printf 'version=%s\nsourceCommit=%s\n' "${tag#v}" "$sha" >> "$GITHUB_OUTPUT"
+          echo "Building $tag at $sha"
+
+  cli-windows-x64:
+    needs: plan
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Select the installed MSVC toolchain
+        shell: pwsh
+        run: ./scripts/ci/msvc.ps1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.1
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/native-client-rust -> target
+          key: wx-cli-win32-x64-${{ needs.plan.outputs.sourceCommit }}-${{ env.RUSTFLAGS }}
+      - name: Build the release executable
+        run: |
+          cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml \
+            --target x86_64-pc-windows-msvc --package wx-native
+      - name: Refuse a dynamically linked runtime or crypto DLL
+        shell: pwsh
+        run: |
+          $binary = 'packages/native-client-rust/target/x86_64-pc-windows-msvc/release/wx.exe'
+          $dependencies = & dumpbin /DEPENDENTS $binary
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect native executable dependencies' }
+          if ($dependencies -match '(?i)(VCRUNTIME|MSVCP|libcrypto-|libssl-|libgcc|libstdc\+\+)') {
+            throw 'Release executable must not require compiler or separately installed crypto DLLs'
+          }
+      - name: Record the verified artifact
+        run: |
+          mkdir -p artifacts/cli
+          cp packages/native-client-rust/target/x86_64-pc-windows-msvc/release/wx.exe \
+             "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-win32-x64.exe"
+          node scripts/ci/artifact.mjs record artifacts/cli --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-windows-x64
+          path: artifacts/cli/*
+          if-no-files-found: error
+
+  cli-windows-arm64:
+    needs: plan
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Select the installed MSVC toolchain
+        shell: pwsh
+        run: ./scripts/ci/msvc.ps1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.1
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/native-client-rust -> target
+          key: wx-cli-win32-arm64-${{ needs.plan.outputs.sourceCommit }}-${{ env.RUSTFLAGS }}
+      - name: Build the release executable
+        run: |
+          cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml \
+            --target aarch64-pc-windows-msvc --package wx-native
+      - name: Record the verified artifact
+        run: |
+          mkdir -p artifacts/cli
+          cp packages/native-client-rust/target/aarch64-pc-windows-msvc/release/wx.exe \
+             "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-win32-arm64.exe"
+          node scripts/ci/artifact.mjs record artifacts/cli --target aarch64-pc-windows-msvc
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-windows-arm64
+          path: artifacts/cli/*
+          if-no-files-found: error
+
+  desktop-windows-x64:
+    needs: [plan, cli-windows-x64]
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Select the installed MSVC toolchain
+        shell: pwsh
+        run: ./scripts/ci/msvc.ps1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.1
+          targets: x86_64-pc-windows-msvc
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @agent-wechat/shared build
+      - run: pnpm --filter @agent-wechat/client-ui build
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            packages/native-client-rust -> target
+            packages/desktop/src-tauri -> target
+          key: desktop-win32-x64-${{ needs.plan.outputs.sourceCommit }}-${{ env.RUSTFLAGS }}
+      - name: Compile the desktop app and its tests
+        run: cargo test --locked --manifest-path packages/desktop/src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
+      - name: Download the CLI built in this run
+        uses: actions/download-artifact@v8
+        with:
+          name: cli-windows-x64
+          path: ${{ runner.temp }}/cli-artifact
+      - name: Restore and verify that exact CLI
+        run: |
+          node scripts/ci/artifact.mjs restore "${RUNNER_TEMP}/cli-artifact" \
+            --target x86_64-pc-windows-msvc --destination "${RUNNER_TEMP}/wx-verified.exe"
+      - name: Bundle it as the desktop sidecar
+        run: |
+          pnpm --filter @agent-wechat/desktop prepare:sidecars \
+            --target x86_64-pc-windows-msvc --wx "${RUNNER_TEMP}/wx-verified.exe"
+      - name: Build the portable folder and the NSIS installer
+        run: |
+          node scripts/release/portable-desktop.mjs \
+            --target x86_64-pc-windows-msvc \
+            --version "${{ needs.plan.outputs.version }}" \
+            --output artifacts/desktop
+          pnpm --filter @agent-wechat/desktop app:bundle --target x86_64-pc-windows-msvc --bundles nsis
+      - name: Stage the installer
+        run: |
+          find packages/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -name '*.exe' \
+            -exec cp {} "artifacts/desktop/AgentWechat-v${{ needs.plan.outputs.version }}-windows-x64-setup.exe" \;
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-windows-x64
+          path: artifacts/desktop/*
+          if-no-files-found: error
+
+  desktop-windows-arm64:
+    needs: [plan, cli-windows-arm64]
+    runs-on: windows-11-arm
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Select the installed MSVC toolchain
+        shell: pwsh
+        run: ./scripts/ci/msvc.ps1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.1
+          targets: aarch64-pc-windows-msvc
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @agent-wechat/shared build
+      - run: pnpm --filter @agent-wechat/client-ui build
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            packages/native-client-rust -> target
+            packages/desktop/src-tauri -> target
+          key: desktop-win32-arm64-${{ needs.plan.outputs.sourceCommit }}-${{ env.RUSTFLAGS }}
+      - name: Compile the desktop app and its tests
+        run: cargo test --locked --manifest-path packages/desktop/src-tauri/Cargo.toml --target aarch64-pc-windows-msvc
+      - name: Download the CLI built in this run
+        uses: actions/download-artifact@v8
+        with:
+          name: cli-windows-arm64
+          path: ${{ runner.temp }}/cli-artifact
+      - name: Restore and verify that exact CLI
+        run: |
+          node scripts/ci/artifact.mjs restore "${RUNNER_TEMP}/cli-artifact" \
+            --target aarch64-pc-windows-msvc --destination "${RUNNER_TEMP}/wx-verified.exe"
+      - name: Bundle it as the desktop sidecar
+        run: |
+          pnpm --filter @agent-wechat/desktop prepare:sidecars \
+            --target aarch64-pc-windows-msvc --wx "${RUNNER_TEMP}/wx-verified.exe"
+      - name: Build the portable folder and the NSIS installer
+        run: |
+          node scripts/release/portable-desktop.mjs \
+            --target aarch64-pc-windows-msvc \
+            --version "${{ needs.plan.outputs.version }}" \
+            --output artifacts/desktop
+          pnpm --filter @agent-wechat/desktop app:bundle --target aarch64-pc-windows-msvc --bundles nsis
+      - name: Stage the installer
+        run: |
+          mkdir -p artifacts/desktop
+          find packages/desktop/src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis -name '*.exe' \
+            -exec cp {} "artifacts/desktop/AgentWechat-v${{ needs.plan.outputs.version }}-windows-arm64-setup.exe" \;
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-windows-arm64
+          path: artifacts/desktop/*
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, cli-windows-x64, cli-windows-arm64, desktop-windows-x64, desktop-windows-arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Download every artifact from this run
+        uses: actions/download-artifact@v8
+        with:
+          pattern: '*'
+          path: artifacts
+          merge-multiple: false
+      - name: Combine and verify every asset against one checksum manifest
+        env:
+          SOURCE_COMMIT: ${{ needs.plan.outputs.sourceCommit }}
+        run: |
+          node scripts/release/publish-checksums.mjs artifacts "${{ needs.plan.outputs.version }}"
+      - name: Publish the release
+        if: inputs.confirm_publish || github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          UPSTREAM_TAG: v${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          body="Windows builds compiled from https://github.com/thisnick/agent-wechat/tree/$UPSTREAM_TAG (commit \`${{ needs.plan.outputs.sourceCommit }}\`)."
+          if ! gh release view "$tag" --json body >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes "$body" --verify-tag || true
+          else
+            gh release edit "$tag" --notes "$body"
+          fi
+          gh release upload "$tag" artifacts/* --clobber

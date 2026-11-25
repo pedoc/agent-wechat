@@ -75,15 +75,16 @@ jobs:
     needs: plan
     runs-on: windows-latest
     timeout-minutes: 90
+    # PowerShell, not Git Bash: Git Bash puts its own link.exe ahead of the MSVC
+    # linker and every build script fails to link.
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Select the installed MSVC toolchain
-        shell: pwsh
         run: ./scripts/ci/msvc.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -95,10 +96,9 @@ jobs:
           key: wx-cli-win32-x64-${{ needs.plan.outputs.sourceCommit }}-${{ env.RUSTFLAGS }}
       - name: Build the release executable
         run: |
-          cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml \
+          cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml `
             --target x86_64-pc-windows-msvc --package wx-native
       - name: Refuse a dynamically linked runtime or crypto DLL
-        shell: pwsh
         run: |
           $binary = 'packages/native-client-rust/target/x86_64-pc-windows-msvc/release/wx.exe'
           $dependencies = & dumpbin /DEPENDENTS $binary
@@ -108,9 +108,9 @@ jobs:
           }
       - name: Record the verified artifact
         run: |
-          mkdir -p artifacts/cli
-          cp packages/native-client-rust/target/x86_64-pc-windows-msvc/release/wx.exe \
-             "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-win32-x64.exe"
+          New-Item -ItemType Directory -Force -Path artifacts/cli | Out-Null
+          Copy-Item 'packages/native-client-rust/target/x86_64-pc-windows-msvc/release/wx.exe' `
+            "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-win32-x64.exe" -Force
           node scripts/ci/artifact.mjs record artifacts/cli --target x86_64-pc-windows-msvc
       - uses: actions/upload-artifact@v7
         with:
@@ -122,15 +122,16 @@ jobs:
     needs: plan
     runs-on: windows-11-arm
     timeout-minutes: 90
+    # PowerShell, not Git Bash: Git Bash puts its own link.exe ahead of the MSVC
+    # linker and every build script fails to link.
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Select the installed MSVC toolchain
-        shell: pwsh
         run: ./scripts/ci/msvc.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -142,13 +143,13 @@ jobs:
           key: wx-cli-win32-arm64-${{ needs.plan.outputs.sourceCommit }}-${{ env.RUSTFLAGS }}
       - name: Build the release executable
         run: |
-          cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml \
+          cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml `
             --target aarch64-pc-windows-msvc --package wx-native
       - name: Record the verified artifact
         run: |
-          mkdir -p artifacts/cli
-          cp packages/native-client-rust/target/aarch64-pc-windows-msvc/release/wx.exe \
-             "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-win32-arm64.exe"
+          New-Item -ItemType Directory -Force -Path artifacts/cli | Out-Null
+          Copy-Item 'packages/native-client-rust/target/aarch64-pc-windows-msvc/release/wx.exe' `
+            "artifacts/cli/wx-v${{ needs.plan.outputs.version }}-win32-arm64.exe" -Force
           node scripts/ci/artifact.mjs record artifacts/cli --target aarch64-pc-windows-msvc
       - uses: actions/upload-artifact@v7
         with:
@@ -160,9 +161,10 @@ jobs:
     needs: [plan, cli-windows-x64]
     runs-on: windows-latest
     timeout-minutes: 180
+    # PowerShell: Git Bash's link.exe would shadow the MSVC linker for cargo.
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     steps:
       - uses: actions/checkout@v7
         with:
@@ -173,7 +175,6 @@ jobs:
           node-version-file: .node-version
           cache: pnpm
       - name: Select the installed MSVC toolchain
-        shell: pwsh
         run: ./scripts/ci/msvc.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -197,23 +198,27 @@ jobs:
           path: ${{ runner.temp }}/cli-artifact
       - name: Restore and verify that exact CLI
         run: |
-          node scripts/ci/artifact.mjs restore "${RUNNER_TEMP}/cli-artifact" \
-            --target x86_64-pc-windows-msvc --destination "${RUNNER_TEMP}/wx-verified.exe"
+          node scripts/ci/artifact.mjs restore "$env:RUNNER_TEMP/cli-artifact" `
+            --target x86_64-pc-windows-msvc --destination "$env:RUNNER_TEMP/wx-verified.exe"
       - name: Bundle it as the desktop sidecar
         run: |
-          pnpm --filter @agent-wechat/desktop prepare:sidecars \
-            --target x86_64-pc-windows-msvc --wx "${RUNNER_TEMP}/wx-verified.exe"
+          pnpm --filter @agent-wechat/desktop prepare:sidecars `
+            --target x86_64-pc-windows-msvc --wx "$env:RUNNER_TEMP/wx-verified.exe"
       - name: Build the portable folder and the NSIS installer
         run: |
-          node scripts/release/portable-desktop.mjs \
-            --target x86_64-pc-windows-msvc \
-            --version "${{ needs.plan.outputs.version }}" \
+          New-Item -ItemType Directory -Force -Path artifacts/desktop | Out-Null
+          node scripts/release/portable-desktop.mjs `
+            --target x86_64-pc-windows-msvc `
+            --version "${{ needs.plan.outputs.version }}" `
             --output artifacts/desktop
           pnpm --filter @agent-wechat/desktop app:bundle --target x86_64-pc-windows-msvc --bundles nsis
       - name: Stage the installer
         run: |
-          find packages/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -name '*.exe' \
-            -exec cp {} "artifacts/desktop/AgentWechat-v${{ needs.plan.outputs.version }}-windows-x64-setup.exe" \;
+          $installer = Get-ChildItem 'packages/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis' -Filter '*.exe' |
+            Select-Object -First 1
+          if (!$installer) { throw 'NSIS packaging produced no installer.' }
+          Copy-Item $installer.FullName `
+            "artifacts/desktop/AgentWechat-v${{ needs.plan.outputs.version }}-windows-x64-setup.exe" -Force
       - uses: actions/upload-artifact@v7
         with:
           name: desktop-windows-x64
@@ -224,9 +229,10 @@ jobs:
     needs: [plan, cli-windows-arm64]
     runs-on: windows-11-arm
     timeout-minutes: 180
+    # PowerShell: Git Bash's link.exe would shadow the MSVC linker for cargo.
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     steps:
       - uses: actions/checkout@v7
         with:
@@ -237,7 +243,6 @@ jobs:
           node-version-file: .node-version
           cache: pnpm
       - name: Select the installed MSVC toolchain
-        shell: pwsh
         run: ./scripts/ci/msvc.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -261,24 +266,27 @@ jobs:
           path: ${{ runner.temp }}/cli-artifact
       - name: Restore and verify that exact CLI
         run: |
-          node scripts/ci/artifact.mjs restore "${RUNNER_TEMP}/cli-artifact" \
-            --target aarch64-pc-windows-msvc --destination "${RUNNER_TEMP}/wx-verified.exe"
+          node scripts/ci/artifact.mjs restore "$env:RUNNER_TEMP/cli-artifact" `
+            --target aarch64-pc-windows-msvc --destination "$env:RUNNER_TEMP/wx-verified.exe"
       - name: Bundle it as the desktop sidecar
         run: |
-          pnpm --filter @agent-wechat/desktop prepare:sidecars \
-            --target aarch64-pc-windows-msvc --wx "${RUNNER_TEMP}/wx-verified.exe"
+          pnpm --filter @agent-wechat/desktop prepare:sidecars `
+            --target aarch64-pc-windows-msvc --wx "$env:RUNNER_TEMP/wx-verified.exe"
       - name: Build the portable folder and the NSIS installer
         run: |
-          node scripts/release/portable-desktop.mjs \
-            --target aarch64-pc-windows-msvc \
-            --version "${{ needs.plan.outputs.version }}" \
+          New-Item -ItemType Directory -Force -Path artifacts/desktop | Out-Null
+          node scripts/release/portable-desktop.mjs `
+            --target aarch64-pc-windows-msvc `
+            --version "${{ needs.plan.outputs.version }}" `
             --output artifacts/desktop
           pnpm --filter @agent-wechat/desktop app:bundle --target aarch64-pc-windows-msvc --bundles nsis
       - name: Stage the installer
         run: |
-          mkdir -p artifacts/desktop
-          find packages/desktop/src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis -name '*.exe' \
-            -exec cp {} "artifacts/desktop/AgentWechat-v${{ needs.plan.outputs.version }}-windows-arm64-setup.exe" \;
+          $installer = Get-ChildItem 'packages/desktop/src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis' -Filter '*.exe' |
+            Select-Object -First 1
+          if (!$installer) { throw 'NSIS packaging produced no installer.' }
+          Copy-Item $installer.FullName `
+            "artifacts/desktop/AgentWechat-v${{ needs.plan.outputs.version }}-windows-arm64-setup.exe" -Force
       - uses: actions/upload-artifact@v7
         with:
           name: desktop-windows-arm64
